@@ -6,7 +6,7 @@
 
 start(_Type, _Args) ->
   Dispatch = cowboy_router:compile([
-          {'_', [{"/ws", ws_handler, []}]}]),
+          {'_', [{"/", ws_handler, []}]}]),
 
   {ok, _} = cowboy:start_clear(my_http_listener, 100, [{port, 8754}],
                                #{env => #{dispatch => Dispatch}}),
