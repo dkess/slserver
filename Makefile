@@ -6,8 +6,6 @@ PROJECT_VERSION = 0.0.1
 SP = 2
 
 DEPS = cowboy
-dep_cowboy_commit = 1.0.4
-
-RELX_OPTS = -d true
+dep_cowboy_commit = e291c3bb940a00cc037a88aee981f8b7df1a7f42
 
 include erlang.mk
