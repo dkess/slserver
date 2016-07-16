@@ -17,8 +17,7 @@
 -export([terminate/2]).
 -export([code_change/3]).
 
-%-record(state, {
-%}).
+-record(state, {gamename, wdict, plist}).
 
 -record(player, {name, pid, gaveup}).
 
@@ -52,7 +51,7 @@ init(_) ->
   process_flag(trap_exit, true),
   {ok, just_started}.
 
-handle_call(list_words, _From, State = {playing, WordDict, _PList}) ->
+handle_call(list_words, _From, State = #state{wdict=WordDict}) ->
   {reply, dict:fetch_keys(WordDict), State};
 
 handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
@@ -60,7 +59,7 @@ handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
   case State of
     just_started ->
       {reply, {ok, []}, {collecting, dict:new(), FromPid, Playername}};
-    {playing, WordDict, PList} ->
+    #state{wdict=WordDict, plist=PList} ->
       {NewPList, PLState} =
         lists:mapfoldl(
           fun(Player = #player{name=N, pid=Pid}, DidFind) ->
@@ -118,14 +117,17 @@ handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
                         end
                     end, NPlist),
 
-          {reply, ok, {playing, WordDict, NPlist}}
+          {reply, ok, State#state{wdict=WordDict, plist=NPlist}}
       end
   end;
 handle_call(end_words, {From, _Tag}, {collecting, WordDict, From, PName}) ->
   {ok, GameName} = lobby_mgr:register_game(),
-  {reply, GameName, {playing, WordDict, [newplayer(PName, From)]}};
+  {reply,
+   GameName,
+   #state{gamename=GameName, wdict=WordDict, plist=[newplayer(PName, From)]}};
 
-handle_call(_Request, _From, State) ->
+handle_call(Request, From, State) ->
+  io:fwrite("call ~p~nfrom ~p~nwith state ~p~n", [Request, From, State]),
   {reply, ignored, State}.
 
 handle_cast({add_word, From, Word, IsGuessed},
@@ -135,7 +137,8 @@ handle_cast({add_word, From, Word, IsGuessed},
             end,
   {noreply, {collecting, dict:store(Word, Guesser, WordDict), From, PName}};
 
-handle_cast({attempt_word, From, Word}, {playing, WordDict, PList}) ->
+handle_cast({attempt_word, From, Word},
+            State = #state{wdict=WordDict, plist=PList}) ->
   case dict:find(Word, WordDict) of
     {ok, noone} ->
       Guesser = get_playername(PList, From),
@@ -146,12 +149,13 @@ handle_cast({attempt_word, From, Word}, {playing, WordDict, PList}) ->
       announce_to_players(fun(Pid) ->
                               ws_handler:word_guessed(Pid, Word, Guesser)
                           end, SPList),
-      {noreply, {playing, NewDict, PList}};
+      {noreply, State#state{wdict=NewDict}};
     _ ->
-      {noreply, {playing, WordDict, PList}}
+      {noreply, State}
   end;
 
-handle_cast({giveup_status, From, Status}, {playing, WordDict, PList}) ->
+handle_cast({giveup_status, From, Status},
+            State = #state{plist=PList}) ->
   % find the player who gave up, and change their flag
   {NewPList, {found, Name}} =
     lists:mapfoldl(fun(P = #player{name=Name, pid=Pid}, PState) ->
@@ -171,9 +175,9 @@ handle_cast({giveup_status, From, Status}, {playing, WordDict, PList}) ->
                         end, SPList),
 
     gen_server:cast(self(), check_allgiveup),
-    {noreply, {playing, WordDict, NewPList}};
+    {noreply, State#state{plist=NewPList}};
 
-handle_cast(check_allgiveup, State = {playing, WordDict, PList}) ->
+handle_cast(check_allgiveup, State = #state{plist=PList, wdict=WordDict}) ->
   case lists:all(fun(#player{pid=Pid, gaveup=GaveUp}) ->
                      (Pid =:= quit) or GaveUp
                  end, PList) of
@@ -182,15 +186,16 @@ handle_cast(check_allgiveup, State = {playing, WordDict, PList}) ->
       NewWordDict = dict:map(fun(_Word, noone) -> "_";
                                 (_Word, Guesser) -> Guesser
                              end, WordDict),
-      {noreply, {playing, NewWordDict, PList}};
+      {noreply, State#state{wdict=NewWordDict}};
     _ ->
       {noreply, State}
   end;
 
-handle_cast(_Msg, State) ->
+handle_cast(Msg, State) ->
+  io:fwrite("cast ~p~nwith state ~p~n", [Msg, State]),
   {noreply, State}.
 
-handle_info({'EXIT', FromPid, Reason}, State = {playing, WordDict, PList}) ->
+handle_info({'EXIT', FromPid, Reason}, State = #state{plist=PList}) ->
   MgrPid = whereis(lobby_mgr),
   case FromPid of
     MgrPid ->
@@ -212,10 +217,11 @@ handle_info({'EXIT', FromPid, Reason}, State = {playing, WordDict, PList}) ->
                           NewPList),
 
       gen_server:cast(self(), check_allgiveup),
-      {noreply, {playing, WordDict, NewPList}}
+      {noreply, State#state{plist=NewPList}}
   end;
 
-handle_info(_Info, State) ->
+handle_info(Info, State) ->
+  io:fwrite("info ~p~nwith state ~p~n", [Info, State]),
   {noreply, State}.
 
 terminate(_Reason, _State) ->
