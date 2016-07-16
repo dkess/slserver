@@ -3,6 +3,7 @@
 
 %% API.
 -export([start_link/0]).
+-export([watch_game/1]).
 -export([join_game/2]).
 -export([add_word/3]).
 -export([end_words/1]).
@@ -17,14 +18,36 @@
 -export([terminate/2]).
 -export([code_change/3]).
 
--record(state, {gamename, wdict, plist}).
+% The amount of milliseconds a game can be left empty for, before being destroyed
+-define(EMPTY_TIME, timer:hours(24)).
 
--record(player, {name, pid, gaveup}).
+% The amount of time in milliseconds it should take to create a game.
+-define(CREATE_TIME, 5000).
+
+-record(player, {name :: string(),
+                 pid :: pid(),
+                 gaveup = false :: boolean()}).
+
+-record(state, {gamename :: string(),
+                % mapping of words to their guesser
+                wdict :: dict:dict(string(), noone | string()),
+                % list of players in order of join time
+                plist :: list(#player{}),
+                % set of PIDs of websockets that have not yet entered their name
+                wset = sets:new() :: sets:set(pid()),
+                % Ref to a timer that will end the game after a certain amount
+                % of time if no one joins
+                destroy_ref = alive :: alive | {timer, timer:tref()}}).
 
 %% API.
 -spec start_link() -> {ok, pid()}.
 start_link() ->
   gen_server:start_link(?MODULE, [], []).
+
+% The message sent when joining a game before having picked a name
+-spec watch_game(identifier()) -> any().
+watch_game(GamePid) ->
+  gen_server:cast(GamePid, {watch_game, self()}).
 
 -spec join_game(identifier(), string()) -> ok | taken.
 join_game(GamePid, Playername) ->
@@ -48,8 +71,8 @@ giveup_status(GamePid, Gaveup) ->
 
 %% gen_server.
 init(_) ->
-  process_flag(trap_exit, true),
-  {ok, just_started}.
+  {ok, Timer} = timer:exit_after(?CREATE_TIME, {timer_end, create_timeout}),
+  {ok, {just_started, Timer}}.
 
 handle_call(list_words, _From, State = #state{wdict=WordDict}) ->
   {reply, dict:fetch_keys(WordDict), State};
@@ -57,9 +80,9 @@ handle_call(list_words, _From, State = #state{wdict=WordDict}) ->
 handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
   link(FromPid),
   case State of
-    just_started ->
-      {reply, {ok, []}, {collecting, dict:new(), FromPid, Playername}};
-    #state{wdict=WordDict, plist=PList} ->
+    {just_started, Timer} ->
+      {reply, {ok, []}, {collecting, dict:new(), FromPid, Playername, Timer}};
+    #state{wdict=WordDict, plist=PList, wset=WSet, destroy_ref=Destroy} ->
       {NewPList, PLState} =
         lists:mapfoldl(
           fun(Player = #player{name=N, pid=Pid}, DidFind) ->
@@ -79,6 +102,15 @@ handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
         taken ->
           {reply, taken, State};
         _ ->
+          % cancel the destroy timer if there is one
+          case Destroy of
+            alive -> ok;
+            {timer, Timer} ->
+              timer:cancel(Timer)
+          end,
+
+          NewWSet = sets:del_element(FromPid, WSet),
+
           % send the player_joined message to everyone else
           announce_to_players(fun(Pid) ->
                                   ws_handler:player_joined(Pid, Playername)
@@ -86,7 +118,8 @@ handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
 
           NPlist = case PLState of
                      replaced -> NewPList;
-                     nothing -> [newplayer(Playername, FromPid) | NewPList]
+                     nothing ->
+                       [#player{name=Playername, pid=FromPid} | NewPList]
                    end,
 
           % inform the newly joined player of the list of players
@@ -117,24 +150,43 @@ handle_call({join_game, Playername}, {FromPid, _Tag}, State) ->
                         end
                     end, NPlist),
 
-          {reply, ok, State#state{wdict=WordDict, plist=NPlist}}
+          {reply, ok, State#state{plist=NPlist,
+                                  wset=NewWSet,
+                                  destroy_ref=alive}}
       end
   end;
-handle_call(end_words, {From, _Tag}, {collecting, WordDict, From, PName}) ->
+
+handle_call(end_words, {From, _Tag},
+            {collecting, WordDict, From, PName, Timer}) ->
+  timer:cancel(Timer),
+  process_flag(trap_exit, true),
   {ok, GameName} = lobby_mgr:register_game(),
   {reply,
    GameName,
-   #state{gamename=GameName, wdict=WordDict, plist=[newplayer(PName, From)]}};
+   #state{gamename=GameName,
+          wdict=WordDict,
+          plist=[#player{name=PName, pid=From}]}};
 
 handle_call(_Request, _From, State) ->
   {reply, ignored, State}.
 
 handle_cast({add_word, From, Word, IsGuessed},
-            {collecting, WordDict, From, PName}) ->
+            {collecting, WordDict, From, PName, Timer}) ->
   Guesser = if IsGuessed -> PName;
                true -> noone
             end,
-  {noreply, {collecting, dict:store(Word, Guesser, WordDict), From, PName}};
+  {noreply, {collecting, dict:store(Word, Guesser, WordDict), From, PName, Timer}};
+
+handle_cast({watch_game, Pid},
+            State = #state{wset=WSet, destroy_ref=Destroy}) ->
+  link(Pid),
+  % cancel the destroy timer if there is one
+  case Destroy of
+    alive -> ok;
+    {timer, Timer} ->
+      timer:cancel(Timer)
+  end,
+  {noreply, State#state{wset=sets:add_element(Pid, WSet), destroy_ref=alive}};
 
 handle_cast({attempt_word, From, Word},
             State = #state{wdict=WordDict, plist=PList}) ->
@@ -177,9 +229,14 @@ handle_cast({giveup_status, From, Status},
     {noreply, State#state{plist=NewPList}};
 
 handle_cast(check_allgiveup, State = #state{plist=PList, wdict=WordDict}) ->
-  case lists:all(fun(#player{pid=Pid, gaveup=GaveUp}) ->
-                     (Pid =:= quit) or GaveUp
-                 end, PList) of
+  % We give up if these two conditions are met: a) everyone who hasn't quit
+  % has voted to give, and b) at least one person has voted to give up.
+  % That second condition ensures that the game isn't given up if everyone
+  % leaves.
+  case (lists:all(fun(#player{pid=Pid, gaveup=GaveUp}) ->
+                      (Pid =:= quit) or GaveUp
+                  end, PList)
+        andalso lists:any(fun(#player{gaveup=G}) -> G end, PList)) of
     true ->
       announce_to_players(fun ws_handler:allgiveup/1, PList),
       NewWordDict = dict:map(fun(_Word, noone) -> "_";
@@ -190,36 +247,58 @@ handle_cast(check_allgiveup, State = #state{plist=PList, wdict=WordDict}) ->
       {noreply, State}
   end;
 
+handle_cast(check_empty, State = #state{plist=PList, wset=WSet}) ->
+  case sets:size(WSet) == 0
+       andalso lists:all(fun(#player{pid=Pid}) -> Pid =:= quit end, PList) of
+    true ->
+      % set a destroy timer
+      {ok, Timer} = timer:exit_after(?EMPTY_TIME, {timer_end, normal}),
+      {noreply, State#state{destroy_ref={timer, Timer}}};
+    _ ->
+      {noreply, State}
+  end;
+
 handle_cast(_Msg, State) ->
   {noreply, State}.
 
-handle_info({'EXIT', FromPid, Reason}, State = #state{plist=PList}) ->
-  MgrPid = whereis(lobby_mgr),
-  case FromPid of
-    MgrPid ->
-      {stop, {mgr_killed, Reason}, State};
+handle_info({'EXIT', _TimerPid, {timer_end, TimerEndReason}}, State) ->
+  {stop, TimerEndReason, State};
+
+handle_info({'EXIT', FromPid, _Reason},
+            State = #state{plist=PList, wset=WSet}) ->
+  gen_server:cast(self(), check_empty),
+
+  case sets:is_element(FromPid, WSet) of
+    true ->
+      NewWSet = sets:del_element(FromPid, WSet),
+      {noreply, State#state{wset=NewWSet}};
     _ ->
       % change this player's state to 'quit' in the player list
       {NewPList, {found, Name}} =
-        lists:mapfoldl(fun(P = #player{pid=Pid, name=Name}, PState) ->
-                           case {PState, Pid} of
-                             {nothing, FromPid} ->
-                               {P#player{pid=quit, gaveup=false}, {found, Name}};
-                             _ ->
-                               {P, PState}
-                           end
-                       end, nothing, PList),
+      lists:mapfoldl(fun(P = #player{pid=Pid, name=Name}, PState) ->
+                         case {PState, Pid} of
+                           {nothing, FromPid} ->
+                             {P#player{pid=quit, gaveup=false}, {found, Name}};
+                           _ ->
+                             {P, PState}
+                         end
+                     end, nothing, PList),
 
       % inform everyone else that this player has quit
       announce_to_players(fun(P) -> ws_handler:player_quit(P, Name) end,
                           NewPList),
 
       gen_server:cast(self(), check_allgiveup),
+
       {noreply, State#state{plist=NewPList}}
   end;
 
 handle_info(_Info, State) ->
   {noreply, State}.
+
+terminate(_Reason, #state{gamename=GameName}) ->
+  lobby_mgr:destroy_game(GameName),
+  ok;
 
 terminate(_Reason, _State) ->
   ok.
@@ -242,6 +321,3 @@ announce_to_players(Fun, PList) ->
                     _ -> Fun(Pid)
                   end
               end, ok, PList).
-
-newplayer(Name, Pid) ->
-  #player{name=Name, pid=Pid, gaveup=false}.

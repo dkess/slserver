@@ -6,6 +6,7 @@
 -export([find_game/1]).
 -export([new_coop_game/1]).
 -export([register_game/0]).
+-export([destroy_game/1]).
 
 -export([validate_name/1]).
 
@@ -45,6 +46,10 @@ new_coop_game(Playername) ->
 register_game() ->
   gen_server:call(?MODULE, register_game).
 
+-spec destroy_game(string()) -> any().
+destroy_game(GameName) ->
+  gen_server:cast(?MODULE, {destroy_game, GameName}).
+
 %% gen_server.
 init([]) ->
   {ok, dict:new()}.
@@ -68,6 +73,9 @@ handle_call({find_game, GameName}, _From, GamesDict) ->
 
 handle_call(_Request, _From, State) ->
   {reply, ignored, State}.
+
+handle_cast({destroy_game, GameName}, GamesDict) ->
+  {noreply, dict:erase(GameName, GamesDict)};
 
 handle_cast(_Msg, State) ->
   {noreply, State}.
