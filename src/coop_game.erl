@@ -126,8 +126,7 @@ handle_call(end_words, {From, _Tag}, {collecting, WordDict, From, PName}) ->
    GameName,
    #state{gamename=GameName, wdict=WordDict, plist=[newplayer(PName, From)]}};
 
-handle_call(Request, From, State) ->
-  io:fwrite("call ~p~nfrom ~p~nwith state ~p~n", [Request, From, State]),
+handle_call(_Request, _From, State) ->
   {reply, ignored, State}.
 
 handle_cast({add_word, From, Word, IsGuessed},
@@ -191,8 +190,7 @@ handle_cast(check_allgiveup, State = #state{plist=PList, wdict=WordDict}) ->
       {noreply, State}
   end;
 
-handle_cast(Msg, State) ->
-  io:fwrite("cast ~p~nwith state ~p~n", [Msg, State]),
+handle_cast(_Msg, State) ->
   {noreply, State}.
 
 handle_info({'EXIT', FromPid, Reason}, State = #state{plist=PList}) ->
@@ -220,8 +218,7 @@ handle_info({'EXIT', FromPid, Reason}, State = #state{plist=PList}) ->
       {noreply, State#state{plist=NewPList}}
   end;
 
-handle_info(Info, State) ->
-  io:fwrite("info ~p~nwith state ~p~n", [Info, State]),
+handle_info(_Info, State) ->
   {noreply, State}.
 
 terminate(_Reason, _State) ->
