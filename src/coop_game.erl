@@ -9,6 +9,7 @@
 -export([end_words/1]).
 -export([attempt_word/2]).
 -export([giveup_status/2]).
+-export([list_players/1]).
 
 %% gen_server.
 -export([init/1]).
@@ -68,6 +69,9 @@ attempt_word(GamePid, Word) ->
 -spec giveup_status(identifier(), boolean()) -> any().
 giveup_status(GamePid, Gaveup) ->
   gen_server:cast(GamePid, {giveup_status, self(), Gaveup}).
+
+list_players(GamePid) ->
+  gen_server:call(GamePid, list_players).
 
 %% gen_server.
 init(_) ->
@@ -166,6 +170,9 @@ handle_call(end_words, {From, _Tag},
    #state{gamename=GameName,
           wdict=WordDict,
           plist=[#player{name=PName, pid=From}]}};
+
+handle_call(list_players, _From, State = #state{plist=PList}) ->
+  {reply, PList, State};
 
 handle_call(_Request, _From, State) ->
   {reply, ignored, State}.

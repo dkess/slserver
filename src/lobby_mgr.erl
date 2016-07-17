@@ -7,6 +7,7 @@
 -export([new_coop_game/1]).
 -export([register_game/0]).
 -export([destroy_game/1]).
+-export([list_games/0]).
 
 -export([validate_name/1]).
 
@@ -50,6 +51,9 @@ register_game() ->
 destroy_game(GameName) ->
   gen_server:cast(?MODULE, {destroy_game, GameName}).
 
+list_games() ->
+  gen_server:call(?MODULE, list_games).
+
 %% gen_server.
 init([]) ->
   {ok, dict:new()}.
@@ -70,6 +74,14 @@ handle_call({find_game, GameName}, _From, GamesDict) ->
           noexist
       end,
   {reply, R, GamesDict};
+
+handle_call(list_games, _From, GamesDict) ->
+  GamesList = dict:to_list(GamesDict),
+  {reply,
+   lists:map(fun({GameName, GamePid}) ->
+                 {GameName, GamePid, coop_game:list_players(GamePid)}
+             end, GamesList),
+   GamesDict};
 
 handle_call(_Request, _From, State) ->
   {reply, ignored, State}.
